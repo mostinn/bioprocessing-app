@@ -706,40 +706,62 @@ def calculate_productivity_metrics(df, mode, params):
         if mode == "Batch":
             initial_volume = params.get('initial_volume', 1.0)
             metrics['Biomass Productivity (g/L/h)'] = (final_biomass - initial_biomass) / total_time
-            metrics['Product Productivity (g/L/h)'] = (final_product - initial_product) / total_time
-            metrics['Total Biomass Produced (g)'] = (final_biomass - initial_biomass) * initial_volume
-            metrics['Total Product Produced (g)'] = (final_product - initial_product) * initial_volume
+            metrics['Product Productivity (g/L/h)'] = final_product / total_time
+            metrics['Total Biomass Produced (g)'] = final_biomass * initial_volume
+            metrics['Total Product Produced (g)'] = final_product * initial_volume
             
         elif mode == "Fed-Batch":
             final_volume = df['Volume (L)'].iloc[-1] if 'Volume (L)' in df.columns else params.get('initial_volume', 1.0)
             metrics['Biomass Productivity (g/L/h)'] = (final_biomass - initial_biomass) / total_time
-            metrics['Product Productivity (g/L/h)'] = (final_product - initial_product) / total_time
-            metrics['Total Biomass Produced (g)'] = (final_biomass * final_volume) - (initial_biomass * params.get('initial_volume', 1.0))
+            metrics['Product Productivity (g/L/h)'] = final_product / total_time
+            metrics['Total Biomass Produced (g)'] = final_biomass * final_volume
             metrics['Total Product Produced (g)'] = final_product * final_volume
             
         elif mode == "Repeated Fed-Batch":
-            cycle_time = params.get('cycle_time', 24)
             num_cycles = params.get('num_cycles', 3)
             harvest_volume_percent = params.get('harvest_volume_percent', 20)
-            initial_volume = params.get('initial_volume', 1.0)
+            
+            # Find harvest events by looking for drops in volume
+            volume_changes = df['Volume (L)'].diff().fillna(0)
+            harvest_events = df[volume_changes < -0.001]
+            
+            total_product_harvested = 0
+            total_biomass_harvested = 0
+            for index, event in harvest_events.iterrows():
+                # Concentrations just before the harvest
+                product_conc_before = df.loc[index - 1, product_col]
+                biomass_conc_before = df.loc[index - 1, 'Biomass (g/L)']
+                # Volume harvested
+                volume_before = df.loc[index - 1, 'Volume (L)']
+                harvest_volume = volume_before * (harvest_volume_percent / 100.0)
+                
+                total_product_harvested += product_conc_before * harvest_volume
+                total_biomass_harvested += biomass_conc_before * harvest_volume
 
-            #This is a simplification, in reality volume changes.
-            harvest_volume = initial_volume * (harvest_volume_percent / 100.0)
+            # Add the final amount remaining in the reactor to the total harvested amount
+            final_volume = df['Volume (L)'].iloc[-1]
+            total_biomass_produced = total_biomass_harvested + (final_biomass * final_volume)
+            total_product_produced = total_product_harvested + (final_product * final_volume)
 
-            biomass_per_cycle = final_biomass * harvest_volume
-            product_per_cycle = final_product * harvest_volume
-            metrics['Biomass Productivity (g/L/h)'] = biomass_per_cycle / cycle_time
-            metrics['Product Productivity (g/L/h)'] = product_per_cycle / cycle_time
-            metrics['Total Biomass Produced (g)'] = biomass_per_cycle * num_cycles
-            metrics['Total Product Produced (g)'] = product_per_cycle * num_cycles
+            # Productivity is based on the total amount produced over the entire duration
+            metrics['Biomass Productivity (g/L/h)'] = (total_biomass_produced / params.get('initial_volume', 1.0)) / total_time
+            metrics['Product Productivity (g/L/h)'] = (total_product_produced / params.get('initial_volume', 1.0)) / total_time
+            metrics['Total Biomass Produced (g)'] = total_biomass_produced
+            metrics['Total Product Produced (g)'] = total_product_produced
             
         elif mode == "Bleed-Perfusion":
-            bleed_rate = params.get('bleed_rate', 0.01)
+            feed_rate = params.get('feed_rate', 0.0)
+            bleed_rate = params.get('bleed_rate', 0.0)
             volume = params.get('initial_volume', 1.0)
-            metrics['Biomass Productivity (g/L/h)'] = final_biomass * bleed_rate / volume
-            metrics['Product Productivity (g/L/h)'] = final_product * bleed_rate / volume
-            metrics['Total Biomass Produced (g)'] = final_biomass * bleed_rate * total_time
-            metrics['Total Product Produced (g)'] = final_product * bleed_rate * total_time
+
+            # For perfusion, to align with the "last row of the Data Table" as requested,
+            # we will report the final amount present in the reactor.
+            # The productivity metrics are instantaneous rates at the final time point.
+            D = feed_rate / volume # Total liquid outflow dilution rate
+            metrics['Biomass Productivity (g/L/h)'] = final_biomass * (bleed_rate / volume)
+            metrics['Product Productivity (g/L/h)'] = final_product * D
+            metrics['Total Biomass Produced (g)'] = final_biomass * volume
+            metrics['Total Product Produced (g)'] = final_product * volume
         
         initial_substrate = df['Substrate (g/L)'].iloc[0]
         final_substrate = df['Substrate (g/L)'].iloc[-1]
@@ -1262,9 +1284,9 @@ with st.expander("📊 Process Performance", expanded=False):
     
     if all_metrics:
         metrics_df = pd.DataFrame(all_metrics)
+        metrics_df_display = metrics_df.set_index('Run') # Use a separate df for display
         # Set 'Run' as the index for better display
-        metrics_df.set_index('Run', inplace=True)
-        st.dataframe(metrics_df.style.format("{:.4f}"))
+        st.dataframe(metrics_df_display.style.format("{:.4f}"))
 
         # Display crash warnings based on the last run's data
         if mode == "Bleed-Perfusion" and hasattr(perfusion_kinetics, 'S_max'):
@@ -1275,6 +1297,9 @@ with st.expander("📊 Process Performance", expanded=False):
                 st.error(f"⚠️ CULTURE CRASH DETECTED in the final run (Run {num_runs})!")
             elif current_S < 5 * S_threshold:
                 st.warning(f"⚠️ WARNING - Substrate levels critically low in the final run (Run {num_runs}).")
+    else:
+        # Ensure metrics_df exists even if there are no metrics
+        metrics_df = pd.DataFrame()
 
 with st.expander("🔄 Mode Comparison", expanded=False):
     comparison_data = {
@@ -1331,23 +1356,27 @@ with st.sidebar.expander("🛠️ Scenario Builder", expanded=False):
         save_scenarios(st.session_state.scenarios)
         st.success(f"Scenario '{scenario_name}' saved to scenarios.json!")
 
-with st.sidebar.expander("📥 Import / Export 📤", expanded=False):
-    # --- Import Scenarios ---
-    uploaded_file = st.file_uploader("Upload scenario file", type="json")
-    if uploaded_file is not None:
-        try:
-            uploaded_scenarios = json.load(uploaded_file)
-            st.session_state.scenarios.update(uploaded_scenarios)
-            save_scenarios(st.session_state.scenarios)
-            st.success(f"Imported {len(uploaded_scenarios)} scenarios!")
-        except json.JSONDecodeError:
-            st.error("Invalid JSON file format")
+    # --- Import Scenarios (remains in sidebar) ---
+    with st.sidebar.expander("📥 Import Scenarios", expanded=False):
+        uploaded_file = st.file_uploader("Upload scenario file", type="json")
+        if uploaded_file is not None:
+            try:
+                uploaded_scenarios = json.load(uploaded_file)
+                st.session_state.scenarios.update(uploaded_scenarios)
+                save_scenarios(st.session_state.scenarios)
+                st.success(f"Imported {len(uploaded_scenarios)} scenarios!")
+            except json.JSONDecodeError:
+                st.error("Invalid JSON file format")
 
-    # --- Export Tool ---
-    file_name = st.text_input("Enter file name for export", "simulation_data.csv")
-    if st.button("Export Data to CSV"):
-        df_main.to_csv(file_name, index=False)
-        st.success(f"Data exported to {file_name}!")
+# --- Export Tools (moved to main panel) ---
+with st.expander("📥 Export Data", expanded=False):
+    export_col1, export_col2 = st.columns(2)
+    with export_col1:
+        st.markdown("##### Full Simulation Data")
+        st.download_button("Download as CSV", df_main.to_csv(index=False), "simulation_data.csv", "text/csv", use_container_width=True)
+    with export_col2:
+        st.markdown("##### Process Metrics Data")
+        st.download_button("Download as CSV", metrics_df.to_csv(index=False), "process_metrics.csv", "text/csv", use_container_width=True, disabled=metrics_df.empty)
 
 # --- Footer ---
 st.markdown("---")
