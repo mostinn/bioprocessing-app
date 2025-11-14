@@ -65,6 +65,23 @@ def load_scenarios():
                 "cell_retention": 0.95,
             }
         },
+        "High-Productivity Perfusion": {
+            "mode": "Bleed-Perfusion",
+            "params": {
+                "initial_substrate": 60.0,
+                "initial_biomass": 5.0,
+                "initial_volume": 1.0,
+                "mu_max": 0.5,
+                "ks": 0.5,
+                "Y_xs": 0.6,
+                "Y_xp": 0.5,
+                "product_name": "High-Value Protein",
+                "feed_rate": 0.5,
+                "feed_substrate": 400.0,
+                "bleed_rate": 0.05,
+                "cell_retention": 0.99,
+            }
+        },
         "Substrate-Limited Fed-Batch": {
             "mode": "Fed-Batch",
             "params": {
@@ -785,8 +802,7 @@ def perfusion_kinetics(y, t, mu_max, Ks, Y_xs, Y_xp, D, Sf, R, D_bleed):
     """
     # Extract current state
     X, S, P = y
-    S = max(0.0, S)  # Ensure non-negative substrate
-    D_total = D + D_bleed
+    S = max(0.0, S)  # Ensure non-negative substrate    
     
     # Track maximum substrate concentration
     if not hasattr(perfusion_kinetics, 'S_max'):
@@ -799,9 +815,9 @@ def perfusion_kinetics(y, t, mu_max, Ks, Y_xs, Y_xp, D, Sf, R, D_bleed):
     # Culture state determination
     if S <= S_threshold:
         # CRASH STATE: Complete cessation of biological activity
-        dX_dt = -D_total * X    # Cell washout
-        dS_dt = D * (Sf - S)    # Substrate dilution only
-        dP_dt = -D_total * P    # Product washout
+        dX_dt = -(1 - R) * D * X - D_bleed * X # Cell washout by overflow and bleed
+        dS_dt = D * (Sf - S) - D_bleed * S     # Substrate dilution by feed, washout by overflow and bleed
+        dP_dt = -D * P - D_bleed * P           # Product washout by overflow and bleed
         
         # Store crash state for UI indicators
         perfusion_kinetics.crashed = True
@@ -811,20 +827,20 @@ def perfusion_kinetics(y, t, mu_max, Ks, Y_xs, Y_xp, D, Sf, R, D_bleed):
         mu = mu_max * S / (Ks + S)
         
         # Cell mass balance
-        cell_growth = mu * X                    # Growth
-        cell_overflow = -(1.0 - R) * D * X      # Overflow loss (with retention)
-        cell_bleed = -D_bleed * X              # Controlled removal
+        cell_growth = mu * X                     # Growth
+        cell_overflow = -(1.0 - R) * D * X       # Overflow loss (imperfect retention)
+        cell_bleed = -D_bleed * X                # Controlled removal via bleed
         dX_dt = cell_growth + cell_overflow + cell_bleed
         
         # Substrate mass balance
-        substrate_in = D * Sf                   # Feed in
-        substrate_out = -D_total * S            # Flow out
-        substrate_consumed = -(mu * X / Y_xs)   # Consumption
+        substrate_in = D * Sf                    # Feed in
+        substrate_out = -D * S                   # Total liquid out (permeate + bleed)
+        substrate_consumed = -(mu * X / Y_xs)    # Consumption by cells
         dS_dt = substrate_in + substrate_out + substrate_consumed
         
         # Product mass balance
-        product_formation = Y_xp * mu * X       # Formation
-        product_out = -D_total * P              # Flow out
+        product_formation = Y_xp * mu * X        # Formation by cells
+        product_out = -D * P                     # Total product removal (harvest)
         dP_dt = product_formation + product_out
         
         # Update crash tracking
@@ -897,25 +913,65 @@ def unified_cstr_kinetics(y, t,
 # --- Simulation Runner ---
 def run_simulation(mode, params):
     t_span = np.linspace(0, 50, 500)
+    
+    # Create a mutable copy of params to apply variability
+    sim_params = params.copy()
+
+    # Automatically apply a random variability strength between 0% and 20% for each run.
+    variability_strength = np.random.uniform(0, 20) / 100.0 # Convert percentage to fraction
+    
+    # Apply variability to relevant parameters
+    # Keys to vary: mu_max, ks, Y_xs, Y_xp
+    # Ensure they remain positive and within reasonable bounds
+    
+    # mu_max
+    if 'mu_max' in sim_params:
+        original_value = sim_params['mu_max']
+        random_factor = np.random.normal(0, variability_strength)
+        varied_value = original_value * (1 + random_factor)
+        sim_params['mu_max'] = max(0.01, varied_value) # Ensure positive
+
+    # ks
+    if 'ks' in sim_params:
+        original_value = sim_params['ks']
+        random_factor = np.random.normal(0, variability_strength)
+        varied_value = original_value * (1 + random_factor)
+        sim_params['ks'] = max(0.01, varied_value) # Ensure positive
+
+    # Y_xs
+    if 'Y_xs' in sim_params:
+        original_value = sim_params['Y_xs']
+        random_factor = np.random.normal(0, variability_strength)
+        varied_value = original_value * (1 + random_factor)
+        sim_params['Y_xs'] = max(0.1, min(1.0, varied_value)) # Ensure between 0.1 and 1.0
+
+    # Y_xp
+    if 'Y_xp' in sim_params:
+        original_value = sim_params['Y_xp']
+        random_factor = np.random.normal(0, variability_strength)
+        varied_value = original_value * (1 + random_factor)
+        sim_params['Y_xp'] = max(0.01, min(1.0, varied_value)) # Ensure between 0.01 and 1.0
+
+
     df = pd.DataFrame()
     product_name = params.get('product_name', 'Product')
 
     if mode == "Batch":
-        y0 = [params['initial_biomass'], params['initial_substrate'], 0.0]
-        sol = odeint(batch_kinetics, y0, t_span, args=(params['mu_max'], params['ks'], params['Y_xs'], params['Y_xp']))
+        y0 = [sim_params['initial_biomass'], sim_params['initial_substrate'], 0.0]
+        sol = odeint(batch_kinetics, y0, t_span, args=(sim_params['mu_max'], sim_params['ks'], sim_params['Y_xs'], sim_params['Y_xp']))
         X, S, P = sol[:, 0], sol[:, 1], sol[:, 2]
         df = pd.DataFrame({"Time (h)": t_span, "Biomass (g/L)": X, "Substrate (g/L)": S, f"{product_name} (g/L)": P})
 
     elif mode == "Fed-Batch":
         total_time = 50
-        exchange_time = params.get('exchange_time', 25)
+        exchange_time = sim_params.get('exchange_time', 25)
 
-        y0 = [params['initial_biomass'], params['initial_substrate'], 0.0]
-        V = params['initial_volume']
+        y0 = [sim_params['initial_biomass'], sim_params['initial_substrate'], 0.0]
+        V = sim_params['initial_volume']
 
         # 1. Batch phase before exchange
-        t_before = np.linspace(0, exchange_time, 250)
-        sol_before = odeint(batch_kinetics, y0, t_before, args=(params['mu_max'], params['ks'], params['Y_xs'], params['Y_xp']))
+        t_before = np.linspace(0, exchange_time, 250) 
+        sol_before = odeint(batch_kinetics, y0, t_before, args=(sim_params['mu_max'], sim_params['ks'], sim_params['Y_xs'], sim_params['Y_xp']))
 
         # Store results
         t_results = list(t_before)
@@ -925,15 +981,15 @@ def run_simulation(mode, params):
         v_results = [V] * len(t_before) # Volume is constant during batch phase
 
         # 2. Apply the 20% volume exchange
-        y_before_exchange = sol_before[-1]
+        y_before_exchange = sol_before[-1] 
         X_before, S_before, P_before = y_before_exchange[0], y_before_exchange[1], y_before_exchange[2]
         
-        exchange_volume_percent = params.get('exchange_volume_percent', 20)
+        exchange_volume_percent = sim_params.get('exchange_volume_percent', 20)
         exchange_fraction = exchange_volume_percent / 100.0
         keep_fraction = 1.0 - exchange_fraction
 
         # Concentrations after exchange
-        S_after = keep_fraction * S_before + exchange_fraction * params['feed_substrate']
+        S_after = keep_fraction * S_before + exchange_fraction * sim_params['feed_substrate']
         X_after = keep_fraction * X_before
         P_after = keep_fraction * P_before
         
@@ -951,7 +1007,7 @@ def run_simulation(mode, params):
         y0_after = [X_after, S_after, P_after]
         
         t_after = np.linspace(exchange_time, total_time, 250)
-        sol_after = odeint(batch_kinetics, y0_after, t_after, args=(params['mu_max'], params['ks'], params['Y_xs'], params['Y_xp']))
+        sol_after = odeint(batch_kinetics, y0_after, t_after, args=(sim_params['mu_max'], sim_params['ks'], sim_params['Y_xs'], sim_params['Y_xp']))
 
         # Append results
         t_results.extend(t_after[1:])
@@ -969,21 +1025,21 @@ def run_simulation(mode, params):
         })
 
     elif mode == "Repeated Fed-Batch":
-        first_harvest_time = params.get('first_harvest_time', 24)
-        subsequent_harvest_time = params.get('subsequent_harvest_time', 24)
-        num_cycles = params.get('num_cycles', 3)
-        harvest_volume_percent = params.get('harvest_volume_percent', 20)
+        first_harvest_time = sim_params.get('first_harvest_time', 24)
+        subsequent_harvest_time = sim_params.get('subsequent_harvest_time', 24)
+        num_cycles = sim_params.get('num_cycles', 3)
+        harvest_volume_percent = sim_params.get('harvest_volume_percent', 20)
 
         t_total, X_total, S_total, P_total, V_total = [], [], [], [], []
         
-        y0 = [params['initial_biomass'], params['initial_substrate'], 0.0]
-        V0 = params['initial_volume']
-        
+        y0 = [sim_params['initial_biomass'], sim_params['initial_substrate'], 0.0]
+        V0 = sim_params['initial_volume']
+
         current_time_offset = 0
 
         # Initial batch phase
         t_first_cycle = np.linspace(0, first_harvest_time, int(first_harvest_time * 10))
-        sol = odeint(batch_kinetics, y0, t_first_cycle, args=(params['mu_max'], params['ks'], params['Y_xs'], params['Y_xp']))
+        sol = odeint(batch_kinetics, y0, t_first_cycle, args=(sim_params['mu_max'], sim_params['ks'], sim_params['Y_xs'], sim_params['Y_xp']))
 
         # Record results
         t_total.extend(t_first_cycle + current_time_offset)
@@ -991,7 +1047,7 @@ def run_simulation(mode, params):
         S_total.extend(sol[:, 1])
         P_total.extend(sol[:, 2])
         V_total.extend([V0] * len(t_first_cycle))
-        
+
         current_time_offset = t_total[-1]
 
         for i in range(num_cycles):
@@ -1012,8 +1068,8 @@ def run_simulation(mode, params):
             # Refeeding (dilution)
             V_after_feed = V_after_harvest + feed_volume
             
-            S_after_feed = (S_after_harvest * V_after_harvest + params['feed_substrate'] * feed_volume) / V_after_feed
-            X_after_feed = X_after_harvest * V_after_harvest / V_after_feed
+            S_after_feed = (S_after_harvest * V_after_harvest + sim_params['feed_substrate'] * feed_volume) / V_after_feed
+            X_after_feed = X_after_harvest * V_after_harvest / V_after_feed # This should be X_after_harvest * (V_after_harvest / V_after_feed)
             P_after_feed = P_after_harvest * V_after_harvest / V_after_feed
 
             y0 = [X_after_feed, S_after_feed, P_after_feed]
@@ -1028,7 +1084,7 @@ def run_simulation(mode, params):
 
             # Subsequent batch phase
             t_subsequent_cycle = np.linspace(0, subsequent_harvest_time, int(subsequent_harvest_time * 10))
-            sol = odeint(batch_kinetics, y0, t_subsequent_cycle, args=(params['mu_max'], params['ks'], params['Y_xs'], params['Y_xp']))
+            sol = odeint(batch_kinetics, y0, t_subsequent_cycle, args=(sim_params['mu_max'], sim_params['ks'], sim_params['Y_xs'], sim_params['Y_xp']))
 
             # Record results
             t_to_add = t_subsequent_cycle[1:] + current_time_offset
@@ -1049,23 +1105,23 @@ def run_simulation(mode, params):
         if hasattr(perfusion_kinetics, 'S_max'):
             delattr(perfusion_kinetics, 'S_max')
         perfusion_kinetics.crashed = False
-            
+
         # Operating parameters
-        V = params['initial_volume']  # L
-        F = params['feed_rate']       # L/h
-        B = params['bleed_rate']      # L/h
+        V = sim_params['initial_volume']  # L
+        F = sim_params['feed_rate']       # L/h
+        B = sim_params['bleed_rate']      # L/h
         D = F / V                     # Feed dilution rate (1/h)
-        D_bleed = B / V              # Bleed dilution rate (1/h)
-        Sf = params['feed_substrate'] # Feed substrate (g/L)
-        R = params['cell_retention']  # Cell retention fraction
-        
+        D_bleed = B / V               # Bleed dilution rate (1/h)
+        Sf = sim_params['feed_substrate'] # Feed substrate (g/L)
+        R = sim_params['cell_retention']  # Cell retention fraction
+
         # Initial state [X, S, P]
-        y0 = [params['initial_biomass'], 
-              params['initial_substrate'],
+        y0 = [sim_params['initial_biomass'], 
+              sim_params['initial_substrate'],
               0.0]  # Start with no product
-        
+
         # Initialize crash detection
-        perfusion_kinetics.S_max = max(Sf, params['initial_substrate'])
+        perfusion_kinetics.S_max = max(Sf, sim_params['initial_substrate'])
         
         # Solve ODEs
         sol = odeint(
@@ -1073,10 +1129,10 @@ def run_simulation(mode, params):
             y0,
             t_span,
             args=(
-                params['mu_max'],
-                params['ks'],
-                params['Y_xs'],
-                params['Y_xp'],
+                sim_params['mu_max'],
+                sim_params['ks'],
+                sim_params['Y_xs'],
+                sim_params['Y_xp'],
                 D,
                 Sf,
                 R,
@@ -1086,7 +1142,7 @@ def run_simulation(mode, params):
         X, S, P = sol[:, 0], sol[:, 1], sol[:, 2]
 
         # Stop simulation when substrate is depleted
-        stop_threshold = params.get('initial_substrate', 10.0) * 0.008
+        stop_threshold = sim_params.get('initial_substrate', 10.0) * 0.008
         stop_point = np.where(S < stop_threshold)
 
         if len(stop_point[0]) > 0:
@@ -1103,15 +1159,24 @@ def run_simulation(mode, params):
 # --- Main Content Area ---
 st.header(f"Simulation Results for {mode} Mode")
 
-# --- Visualization Settings ---
+# --- Simulation Settings ---
+with st.sidebar.expander("⚙️ Simulation Settings", expanded=True):
+    num_runs = st.number_input("Number of Simulation Runs", min_value=1, max_value=50, value=1, step=1, help="Run the simulation multiple times to observe the effect of natural variability.")
+
+# --- Visualization Settings --- 
 with st.sidebar.expander("🎨 Visualization Settings", expanded=True):
-    show_inflection_points = st.checkbox("Show Inflection Points")
-    show_annotations = st.checkbox("Show Annotations")
+    show_inflection_points = st.checkbox("Show Inflection Points", help="Highlights the point of maximum biomass concentration on the graph.")
+    show_annotations = st.checkbox("Show Annotations (Batch Mode Only)")
 
 # --- Overlay Scenarios ---
-overlay_scenarios = st.sidebar.multiselect("Overlay Scenarios", scenario_names)
+overlay_scenarios = st.sidebar.multiselect("Overlay Scenarios", scenario_names, help="Select saved scenarios to plot alongside the current simulation. Note: Overlay is disabled when Number of Runs > 1.")
 
-df_main = run_simulation(mode, current_params)
+all_runs_df = []
+for i in range(num_runs):
+    df_run = run_simulation(mode, current_params)
+    df_run['Run'] = i + 1
+    all_runs_df.append(df_run)
+df_main = pd.concat(all_runs_df, ignore_index=True)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -1119,25 +1184,29 @@ with col1:
         fig = go.Figure()
     
         # Plot main simulation
-        for col in df_main.columns:
-            if col != "Time (h)":
-                fig.add_trace(go.Scatter(x=df_main["Time (h)"], y=df_main[col], mode='lines', name=f"Current - {col}"))
+        for run_num in df_main['Run'].unique():
+            run_df = df_main[df_main['Run'] == run_num]
+            for col in run_df.columns:
+                if col not in ["Time (h)", "Run", "Volume (L)"]:
+                    # Convert numpy.bool_ to Python bool for Plotly compatibility
+                    fig.add_trace(go.Scatter(x=run_df["Time (h)"], y=run_df[col], mode='lines', name=f"Run {run_num} - {col}", showlegend=True, line=dict(width=2 if num_runs == 1 else 1.5)))
 
-        # Plot overlay scenarios
-        for scenario in overlay_scenarios:
-            scenario_data = st.session_state.scenarios[scenario]
-            df_overlay = run_simulation(scenario_data['mode'], scenario_data['params'])
-            for col in df_overlay.columns:
-                if col != "Time (h)":
-                    fig.add_trace(go.Scatter(x=df_overlay["Time (h)"], y=df_overlay[col], mode='lines', name=f"{scenario} - {col}", line=dict(dash='dash')))
+        # Plot overlay scenarios (only if num_runs is 1)
+        if num_runs == 1:
+            for scenario in overlay_scenarios:
+                scenario_data = st.session_state.scenarios[scenario]
+                df_overlay = run_simulation(scenario_data['mode'], scenario_data['params'])
+                for col in df_overlay.columns:
+                    if col not in ["Time (h)", "Run", "Volume (L)"]:
+                        fig.add_trace(go.Scatter(x=df_overlay["Time (h)"], y=df_overlay[col], mode='lines', name=f"{scenario} - {col}", line=dict(dash='dash')))
 
         if show_inflection_points and not df_main.empty:
-            max_biomass_idx = df_main['Biomass (g/L)'].idxmax()
-            max_biomass_time = df_main["Time (h)"][max_biomass_idx]
-            max_biomass_val = df_main['Biomass (g/L)'][max_biomass_idx]
+            first_run_df = df_main[df_main['Run'] == 1]
+            max_biomass_idx = first_run_df['Biomass (g/L)'].idxmax()
+            max_biomass_time, max_biomass_val = first_run_df.loc[max_biomass_idx, ['Time (h)', 'Biomass (g/L)']]
             fig.add_trace(go.Scatter(x=[max_biomass_time], y=[max_biomass_val], mode='markers', name='Max Biomass', marker=dict(size=10, color='red')))
 
-        if show_annotations and not df_main.empty:
+        if show_annotations and not df_main.empty and mode == "Batch":
             fig.add_annotation(x=df_main["Time (h)"][int(len(df_main)/4)], y=df_main['Biomass (g/L)'][int(len(df_main)/4)],
                 text="Lag Phase", showarrow=True, arrowhead=1)
 
@@ -1147,7 +1216,7 @@ with col1:
         # Culture Status Indicators (moved here for immediate visibility)
         if mode == "Bleed-Perfusion" and hasattr(perfusion_kinetics, 'S_max'):
             st.markdown("### 🔬 Culture Status")
-            S_threshold = 0.000015 * perfusion_kinetics.S_max
+            S_threshold = 0.000015 * getattr(perfusion_kinetics, 'S_max', 0)
             current_S = df_main['Substrate (g/L)'].iloc[-1]
         
             if current_S <= S_threshold:
@@ -1181,38 +1250,31 @@ with col2:
         st.dataframe(df_main)
 
 with st.expander("📊 Process Performance", expanded=False):
-    # Check for culture crash in perfusion mode
-    if mode == "Bleed-Perfusion" and hasattr(perfusion_kinetics, 'S_max'):
-        S_threshold = 0.000015 * perfusion_kinetics.S_max
-        current_S = df_main['Substrate (g/L)'].iloc[-1]
+    st.subheader("Process Metrics per Run")
     
-        if current_S <= S_threshold:
-            st.error("⚠️ CULTURE CRASH DETECTED - Severe substrate depletion has stopped all biological activity!")
-            st.info(f"""
-            - Current substrate: {current_S:.4f} g/L
-            - Crash threshold: {S_threshold:.4f} g/L (0.0015% of peak {perfusion_kinetics.S_max:.1f} g/L)
-            - Status: No cell growth, no product formation, washout in progress
-            """)
-        elif current_S < 5 * S_threshold:  # Warning zone
-            st.warning("⚠️ WARNING - Substrate levels critically low, approaching crash threshold!")
-            st.info(f"""
-            - Current substrate: {current_S:.4f} g/L
-            - Crash threshold: {S_threshold:.4f} g/L
-            - Recommended: Check feed rate and substrate concentration
-            """)
+    # Calculate metrics for each run
+    all_metrics = []
+    for run_num in df_main['Run'].unique():
+        run_df = df_main[df_main['Run'] == run_num].reset_index(drop=True)
+        metrics = calculate_productivity_metrics(run_df, mode, current_params)
+        metrics['Run'] = run_num
+        all_metrics.append(metrics)
+    
+    if all_metrics:
+        metrics_df = pd.DataFrame(all_metrics)
+        # Set 'Run' as the index for better display
+        metrics_df.set_index('Run', inplace=True)
+        st.dataframe(metrics_df.style.format("{:.4f}"))
 
-    # Show metrics
-    st.subheader("Process Metrics")
-    metrics = calculate_productivity_metrics(df_main, mode, current_params)
-
-    col3, col4 = st.columns(2)
-    with col3:
-        for key, value in list(metrics.items())[:len(metrics)//2]:
-            st.metric(key, f"{value:.4f}")
-        
-    with col4:
-        for key, value in list(metrics.items())[len(metrics)//2:]:
-            st.metric(key, f"{value:.4f}")
+        # Display crash warnings based on the last run's data
+        if mode == "Bleed-Perfusion" and hasattr(perfusion_kinetics, 'S_max'):
+            S_threshold = 0.000015 * getattr(perfusion_kinetics, 'S_max', 0)
+            last_run_df = df_main[df_main['Run'] == num_runs]
+            current_S = last_run_df['Substrate (g/L)'].iloc[-1]
+            if current_S <= S_threshold:
+                st.error(f"⚠️ CULTURE CRASH DETECTED in the final run (Run {num_runs})!")
+            elif current_S < 5 * S_threshold:
+                st.warning(f"⚠️ WARNING - Substrate levels critically low in the final run (Run {num_runs}).")
 
 with st.expander("🔄 Mode Comparison", expanded=False):
     comparison_data = {
